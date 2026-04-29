@@ -34,7 +34,7 @@ GATE_PLATE_HALF = 0.1  # along the gate axis: thickness of the plane to treat as
 GATE_OPENING_MARGIN = 0.1  # corridor half-width considered safe for passage
 GATE_PUSH_OUT = 0.1 # where to push points that intrude on a bar
 # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
-POST_RADIUS_CLEARANCE = 0.35
+POST_RADIUS_CLEARANCE = 0.25
 POST_TOP_Z = 1.90  # posts extend roughly from the ground to this height
 APPROACH_DIST = 0.4  # offset of the approach waypoint in front of a gate
 EXIT_DIST = 0.4  # offset of the exit waypoint behind a gate
@@ -42,10 +42,10 @@ PATH_SAMPLE_STEP = 0.1  # densification step for the polyline (m)
 RELAX_ITERS = 10  # avoidance / smoothing passes
 SMOOTH_W_SELF = 0.99  # smoothing weights — higher self => weaker smoothing
 SMOOTH_W_NEIGHBOR = 0.
-SMOOTH_W_REF = 0.2  # attraction weight to the previous path to enforce consistency
-TARGET_SPEED = 0.35 # m/s, used to time-parameterize the path
-GATE_REPLAN_DIST = 0.7  # replan when first entering this radius around each gate (m)
-GATE2_APPROACH_SPEED = 0.35  # reduced speed through gate 2 (tight gap)
+SMOOTH_W_REF = 0.8  # attraction weight to the previous path to enforce consistency
+TARGET_SPEED = 0.5 # m/s, used to time-parameterize the path
+GATE_REPLAN_DIST = 3  # replan when first entering this radius around each gate (m)
+GATE2_APPROACH_SPEED = 0.3  # reduced speed through gate 2 (tight gap)
 GATE2_SLOW_RADIUS = 0.8  # m from gate 2 centre over which the slowdown applies
 LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
 
@@ -123,16 +123,29 @@ class AdaptiveController(Controller):
         drone_pos = np.asarray(obs["pos"], dtype=np.float64).flatten()[:3]
         drone_vel = np.asarray(obs.get("vel", [0.0, 0.0, 0.0]), dtype=np.float64).flatten()[:3]
 
+        gates_pos = np.asarray(obs["gates_pos"], dtype=np.float64)
+        gates_quat = np.asarray(obs["gates_quat"], dtype=np.float64)
+
         # Seed the new spline from the previous commanded state, not the drone's measured
         # state.  Otherwise the commanded position snaps from old-spline(t) back to the
         # actual drone position on every replan, which the controller sees as a stutter.
+        # However, clamp the seed so it never projects past the current target gate's
+        # approach plane — otherwise the polyline must loop backward to hit the approach.
         if self._spline is not None and not self._finished:
             t_prev = float(np.clip(self._tick / self._freq - self._t_offset, 0.0, self._t_total))
             drone_pos = np.asarray(self._spline(t_prev), dtype=np.float64).flatten()[:3]
             drone_vel = np.asarray(self._spline(t_prev, 1), dtype=np.float64).flatten()[:3]
-
-        gates_pos = np.asarray(obs["gates_pos"], dtype=np.float64)
-        gates_quat = np.asarray(obs["gates_quat"], dtype=np.float64)
+            tgt_axis = (
+                self.directions[target]
+                if self.directions_set and isinstance(self.directions[target], np.ndarray)
+                else self._gate_forward(gates_quat[target])
+            )
+            tgt_g = gates_pos[target, :3]
+            # Approach point sits at s = -APPROACH_DIST along axis; cap seed to s <= -APPROACH_DIST.
+            s_seed = float(np.dot(drone_pos - tgt_g, tgt_axis))
+            s_max = -APPROACH_DIST
+            if s_seed > s_max:
+                drone_pos = drone_pos - tgt_axis * (s_seed - s_max)
         obstacles_pos = np.asarray(obs["obstacles_pos"], dtype=np.float64)
 
         # 1. Build a clean waypoint list with consistent flight direction.
@@ -168,7 +181,7 @@ class AdaptiveController(Controller):
             if i == 0:
                 app_d = min(0.3, max(0, d * 0.5))
             elif i == 1:
-                app_d = 2.0
+                app_d = 1.0
             elif i == 2:
                 app_d = min(0.5, max(0, d * 0.5))
             elif i == 3:
@@ -176,16 +189,8 @@ class AdaptiveController(Controller):
             else:
                 app_d = 0.4
 
-            # Skip approach / center waypoints that lie behind the current point along
-            # the gate's forward axis — otherwise the polyline (and resulting spline)
-            # loops backward inside the gate when seeded from a commanded state that
-            # has already advanced past them.
-            s_cur = float(np.dot(cur_pt - g, axis))
-            FWD_EPS = 0.05
-            if s_cur < -app_d - FWD_EPS:
-                wps.append(g - axis * app_d)
-            if s_cur < -FWD_EPS:
-                wps.append(g.copy())
+            wps.append(g - axis * app_d)
+            wps.append(g.copy())
             if i == 0:
                 wps.append(g + axis * 1.0)
             elif i == 1:
