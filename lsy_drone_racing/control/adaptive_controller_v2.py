@@ -1,16 +1,22 @@
 """Adaptive gate-tracking controller for drone racing.
 
-This controller dynamically plans trajectories through the race gates using observation data. 
-It features a robust obstacle avoidance system with longitudinal gate protection to ensure 
-safe passage through gate frames while avoiding markers and previously passed gates.
+This controller plans a smooth trajectory through the race gates using a relaxation-based
+obstacle avoidance scheme.  At each replan it builds a polyline of approach / center / exit
+waypoints for every remaining gate, densifies it, and iteratively pushes points away from
+cylindrical post obstacles and gate frames (excluding gates the path is meant to pass
+through).  The result is fit with a Cubic spline parameterized by arclength / target speed.
 """
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
+from scipy.interpolate import CubicSpline
+from scipy.spatial.distance import cdist
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
@@ -19,367 +25,323 @@ if TYPE_CHECKING:
     from crazyflow import Sim
     from numpy.typing import NDArray
 
-def min_distance_drone_gate(drone_pos, gate_pos, gate_quat):
-    """
-    Calculates the minimum distance from the drone to the physical volume of a gate.
-    
-    Args:
-        drone_pos: (3,) array of drone position.
-        gate_pos: (3,) array of gate center position.
-        gate_quat: (4,) array of gate orientation (x, y, z, w).
-        
-    Returns:
-        float: Minimum distance in meters to the nearest collision box of the gate.
-    """
-    # Transform drone_pos into the gate's local coordinate frame
-    rot = R.from_quat(gate_quat.flatten()[:4])
-    p_local = rot.apply(drone_pos.flatten()[:3] - gate_pos.flatten()[:3], inverse=True)
-    
-    # Define collision boxes for the gate frame and stand (center, half-extents)
-    collision_boxes = [
-        (np.array([0, 0, 0.28]), np.array([0.01, 0.36, 0.08])),  # Top bar
-        (np.array([0, 0, -0.28]), np.array([0.01, 0.36, 0.08])), # Bottom bar
-        (np.array([0, -0.28, 0]), np.array([0.01, 0.08, 0.36])), # Left bar
-        (np.array([0, 0.28, 0]), np.array([0.01, 0.08, 0.36])),  # Right bar
-        (np.array([0, 0, -0.86]), np.array([0.05, 0.05, 0.5]))   # Stand/Post
-    ]
-    
-    distances = []
-    for center, half_extents in collision_boxes:
-        # Distance from a point to an axis-aligned box (AABB) in the local frame
-        delta = np.abs(p_local - center) - half_extents
-        v = np.maximum(delta, 0)
-        distances.append(np.linalg.norm(v))
-            
-    return min(distances)
+
+# Geometry constants (meters).
+GATE_INNER_HALF = 0.20      # half-width of the open square inside the gate frame
+GATE_FRAME_HALF = 0.36      # half-width of the outer frame (bar centre is at 0.28, half-extent 0.08)
+GATE_PLATE_HALF = 0.3      # along the gate axis: thickness of the plane to treat as "in frame"
+GATE_OPENING_MARGIN = 0.3  # corridor half-width considered safe for passage
+GATE_PUSH_OUT = 1.0      # where to push points that intrude on a bar
+POST_RADIUS_CLEARANCE = 0.3  # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
+POST_TOP_Z = 1.90           # posts extend roughly from the ground to this height
+APPROACH_DIST = 0.4        # offset of the approach waypoint in front of a gate
+EXIT_DIST = 0.4         # offset of the exit waypoint behind a gate
+PATH_SAMPLE_STEP = 0.1     # densification step for the polyline (m)
+RELAX_ITERS = 20            # avoidance / smoothing passes
+SMOOTH_W_SELF = 0.8        # smoothing weights — higher self => weaker smoothing
+SMOOTH_W_NEIGHBOR = 0.2
+SMOOTH_W_REF = 0.6         # attraction weight to the previous path to enforce consistency
+TARGET_SPEED = 0.35 # m/s, used to time-parameterize the path
+LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
+
 
 class AdaptiveController(Controller):
-    """Gate-aware controller that dynamically re-plans trajectories through observed gates."""
+    """Gate-aware controller that dynamically re-plans through observed gates."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         super().__init__(obs, info, config)
         self._freq = config.env.freq
+        self._n_gates = len(config.env.track.gates)
         self._tick = 0
         self._finished = False
-
-        self._n_gates = len(config.env.track.gates)
-        self._total_budget = 30.0
-        
-        self._last_target_gate = -2
-        self._last_obstacles_visited = None
-        self._cleared_last_gate = True  
-        self.cleared_gates = []
-        self._recalculated_for_approach = -1  
-
-        self._des_pos_spline = None
+        self._spline = None
         self._t_total = 0.0
         self._t_offset = 0.0
-        self._last_replan_time = 0.0
-
+        self._last_target = -2
+        self._last_obs_visited = None
+        self._last_replan_path = None
+        self._last_replan_tick = -10_000
+        self._episode_idx = 0
         self._build_trajectory(obs)
 
-    def _get_forward_vector(self, gate_quat: NDArray) -> NDArray:
-        """Calculates the normalized forward direction vector of a gate."""
-        rot = R.from_quat(gate_quat)
-        forward = rot.apply([1.0, 0.0, 0.0])
-        return forward / (np.linalg.norm(forward) + 1e-8)
+    # ------------------------------------------------------------------ utils
+    @staticmethod
+    def _gate_forward(quat: NDArray) -> NDArray:
+        v = R.from_quat(quat).apply([1.0, 0.0, 0.0])
+        n = np.linalg.norm(v)
+        return v / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
 
-    def _build_trajectory(self, obs: dict[str, NDArray[np.floating]]):
-        target_gate_obs = int(obs["target_gate"])
-        if target_gate_obs == -1 or target_gate_obs >= self._n_gates:
+    @staticmethod
+    def _safe_normalize(v: NDArray) -> NDArray:
+        n = np.linalg.norm(v)
+        return v / n if n > 1e-9 else np.zeros_like(v)
+
+    # -------------------------------------------------------------- planning
+    def _build_trajectory(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        target = int(obs["target_gate"])
+        if target == -1 or target >= self._n_gates:
             self._finished = True
             return
-            
-        drone_pos = np.array(obs["pos"], dtype=np.float64).flatten()[:3]
-        drone_vel = np.array(obs.get("vel", [0, 0, 0]), dtype=np.float64).flatten()[:3]
 
-        # --- PATH CONTINUITY: REUSE N POINTS ---
-        N_points_to_reuse = 2  # Number of future points to stitch (adjust as needed)
-        dt_lookahead = 0.1   # Time gap (seconds) between reused points
-        
-        # Always start exactly where the drone is to prevent jump tracking errors
-        waypoints = [(drone_pos.copy(), -1)]
-        
-        if self._des_pos_spline is not None:
-            # Replanning: Sample the next N points from the currently active trajectory
-            curr_t = np.clip(self._tick / self._freq - self._t_offset, 0.0, self._t_total)
-            for i in range(1, N_points_to_reuse + 1):
-                t_sample = min(curr_t + (i * dt_lookahead), self._t_total)
-                waypoints.append((self._des_pos_spline(t_sample).copy(), -1))
-        else:
-            # Initial plan: Fallback to the velocity vector heuristic to build momentum
-            w1 = drone_pos + (drone_vel * 0.1) 
-            w2 = drone_pos + (drone_vel * 0.2) 
-            waypoints.extend([(w1, -1), (w2, -1)])
+        drone_pos = np.asarray(obs["pos"], dtype=np.float64).flatten()[:3]
+        drone_vel = np.asarray(obs.get("vel", [0.0, 0.0, 0.0]), dtype=np.float64).flatten()[:3]
+        gates_pos = np.asarray(obs["gates_pos"], dtype=np.float64)
+        gates_quat = np.asarray(obs["gates_quat"], dtype=np.float64)
+        obstacles_pos = np.asarray(obs["obstacles_pos"], dtype=np.float64)
 
-        # Proceed with extracting gates and obstacles as usual...
-        gates_pos = np.array(obs["gates_pos"], dtype=np.float64)
-        gates_quat = np.array(obs["gates_quat"], dtype=np.float64)
-        obstacles_pos = np.array(obs["obstacles_pos"], dtype=np.float64)
-        num_regular_obstacles = len(obstacles_pos)
-        
-        target_gate = target_gate_obs
-        obstacles_pos = np.vstack((obstacles_pos, np.array(gates_pos)))            
-            
-        curr_pt = waypoints[-1][0]
-        for i in range(target_gate, self._n_gates):
-            gp = gates_pos[i].flatten()[:3]
-            gate_axis = self._get_forward_vector(gates_quat[i].flatten()[:4])
-            
-            v_to_gate = gp - curr_pt
-            dist_to_gate = np.linalg.norm(v_to_gate) # Get the physical distance
-            
-            fwd = gate_axis if np.dot(v_to_gate, gate_axis) > 0 else -gate_axis
-            
-            # Dynamically scale app_dist. 
-            # It caps at 0.5m, but shrinks if the drone is closer than 1.0m.
-            # Using * 0.5 ensures the waypoint stays halfway between the drone and the gate.
-            app_dist = min(0.6, dist_to_gate * 0.5)
-            ex_dist = 0.7
-            
-            app = gp - fwd * app_dist
-            ex = gp + fwd * ex_dist
-            
-            waypoints.append((app, i))
-            waypoints.append((gp, i))
-            waypoints.append((ex, i))
-                
-            curr_pt = waypoints[-1][0]
+        # 1. Build a clean waypoint list with consistent flight direction.
+        wps: list[np.ndarray] = [drone_pos.copy()]
+        # Optional velocity-aligned anchor so the spline doesn't whip back when replanning.
+        if np.linalg.norm(drone_vel) > 0.4:
+            wps.append(drone_pos + self._safe_normalize(drone_vel) * 0.15)
 
-        # 2. Obstacle Avoidance (Markers & Passed Gates)
-        safe_waypoints = [waypoints[0][0]]
-        
-        for i in range(len(waypoints) ):
-            pA = safe_waypoints[-1]
-            pB = waypoints[i][0]
+        prev_dir = self._safe_normalize(drone_vel) if np.linalg.norm(drone_vel) > 0.4 else None
+        cur_pt = wps[-1].copy()
+        for i in range(target, self._n_gates):
+            g = gates_pos[i, :3]
+            axis = self._gate_forward(gates_quat[i])
             
-            def resolve_segment(start, end, depth=0):
-                # 1. Increased depth limit to handle multiple obstacles on long segments
-                if depth > 2: 
-                    return []
+            # Test both entrance directions to minimize cost to the next gate
+            g_next = gates_pos[i, :3]
+            cost_plus = np.linalg.norm((g - axis * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
+            cost_minus = np.linalg.norm((g - (-axis) * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
+            if cost_minus < cost_plus:
+                axis = -axis
+
+            # Shrink approach if we are already inside it.
+            d = np.linalg.norm(g - cur_pt)
+            if i == 0:
+                app_d = min(0.4, max(0, d * 0.5))
+
+            elif i ==1 :
+                app_d = min(1.5, max(0.15, d * 0.5))
+            elif i == 2 :
+                app_d = min(0.5, max(0, d * 0.5))
+            elif i == 3 :
+                app_d = min(0.2, max(0, d * 0.5))
+            else:
+                app_d = 0.4
                 
-                v3d = end - start
-                len3d_sq = np.dot(v3d, v3d)
-                
-                # For 2D cylinder checks
-                v2d = v3d[:2]
-                len2d_sq = np.dot(v2d, v2d)
-                
-                min_s = float('inf')
-                hit_obs_idx = -1
-                hit_closest_pt = None
-                
-                for idx, obs_p in enumerate(obstacles_pos):
-                    is_frame = idx >= num_regular_obstacles
-                    clearance = 0.2
-                    
-                    if is_frame:
-                        # 3D Sphere/Gate logic
-                        if len3d_sq < 1e-6:
-                            s = 0.5
-                            closest_pt = start
-                        else:
-                            AP = obs_p - start
-                            s = np.clip(np.dot(AP, v3d) / len3d_sq, 0.0, 1.0)
-                            closest_pt = start + s * v3d
-                            
-                        frame_idx = idx - num_regular_obstacles
-                        q = gates_quat[frame_idx]
-                        dist_to_obs = min_distance_drone_gate(closest_pt, obs_p, q)/0.8
-                        
+            wps.append(g - axis * app_d)
+            wps.append(g.copy())
+            if i == 0:
+                wps.append(g + axis * 0.6)
+            elif i ==1 :
+                wps.append(g + axis * 0.6)
+            elif i == 2 :
+                wps.append(g + axis * 0.1)
+                wps.append(g - axis * 0.3)
+
+            elif i == 3 :
+                wps.append(g + axis * 5)
+            elif i == 4 :
+                wps.append(g + axis * EXIT_DIST)
+            prev_dir = axis
+            cur_pt = wps[-1]
+
+        # 2. Densify into a polyline.
+        path: list[np.ndarray] = []
+        for p1, p2 in zip(wps[:-1], wps[1:]):
+            seg_len = np.linalg.norm(p2 - p1)
+            n = max(2, int(np.ceil(seg_len / PATH_SAMPLE_STEP)))
+            path.extend(np.linspace(p1, p2, n)[:-1])
+        path.append(wps[-1])
+        path = np.asarray(path, dtype=np.float64)
+
+        # Mark all indices between the approach and exit waypoints of a gate.
+        # These will be strictly frozen during relaxation to enforce a dead-center straight line.
+        wp_positions = [0]
+        for p1, p2 in zip(wps[:-1], wps[1:]):
+            seg_len = np.linalg.norm(p2 - p1)
+            n = max(2, int(np.ceil(seg_len / PATH_SAMPLE_STEP)))
+            wp_positions.append(wp_positions[-1] + (n - 1))
+            
+        anchor_count = len(wps) - 3 * (self._n_gates - target)
+        gate_locked_idxs: list[int] = []
+        for k in range(self._n_gates - target):
+            app_wp = anchor_count + 3 * k
+            ex_wp = anchor_count + 3 * k + 2
+            start_idx = wp_positions[app_wp]
+            end_idx = wp_positions[ex_wp]
+            gate_locked_idxs.extend(range(start_idx, end_idx + 1))
+        gate_locked_set = set(gate_locked_idxs)
+
+        # 3. Iterative relaxation: smooth first, then push, so the final state stays clear.
+        future_gates = list(range(target, self._n_gates))
+        gate_rots = [R.from_quat(gates_quat[gi]) for gi in range(self._n_gates)]
+
+        # Find closest points on the previously planned path to act as strong attractors 
+        has_ref = self._last_replan_path is not None
+        if has_ref:
+            dists = cdist(path, self._last_replan_path)
+            closest_idx = np.argmin(dists, axis=1)
+            ref_points = self._last_replan_path[closest_idx]
+            # Ignore attraction if the closest point is > 1.5m away (prevents the
+            # path from collapsing backward when planning for newly revealed gates)
+            valid_ref = np.min(dists, axis=1) < 1.5
+
+        def push_point(j: int) -> None:
+            pt = path[j]
+            # 3a. Cylindrical posts.
+            if pt[2] < POST_TOP_Z:
+                for op in obstacles_pos:
+                    delta = pt[:2] - op[:2]
+                    d = float(np.linalg.norm(delta))
+                    if 1e-6 < d < POST_RADIUS_CLEARANCE:
+                        pt[:2] += (delta / d) * (POST_RADIUS_CLEARANCE - d)
+                    elif d <= 1e-6:
+                        pt[:2] += np.array([POST_RADIUS_CLEARANCE, 0.0])
+            # 3b. Gate frames.  Skip corridor of any gate we still plan to pass through.
+            for gi in range(self._n_gates):
+                gp = gates_pos[gi, :3]
+                local = gate_rots[gi].inv().apply(pt - gp)
+                in_opening = (
+                    abs(local[1]) < GATE_OPENING_MARGIN
+                    and abs(local[2]) < GATE_OPENING_MARGIN
+                )
+                if gi in future_gates and in_opening:
+                    continue
+                if (
+                    abs(local[0]) < GATE_PLATE_HALF
+                    and max(abs(local[1]), abs(local[2])) < GATE_FRAME_HALF
+                    and not in_opening
+                ):
+                    if abs(local[1]) > abs(local[2]):
+                        local[1] = np.sign(local[1] or 1.0) * GATE_PUSH_OUT
                     else:
-                        # GEOMETRY FIX: Calculate parameter `s` using only 2D planar math
-                        if len2d_sq < 1e-6:
-                            s = 0.5
-                            closest_pt = start
-                        else:
-                            AP_2d = (obs_p - start)[:2]
-                            s = np.clip(np.dot(AP_2d, v2d) / len2d_sq, 0.0, 1.0)
-                            # We map the 2D 's' back to the 3D line to find the actual collision height
-                            closest_pt = start + s * v3d
-                        
-                        dist_to_obs = np.linalg.norm((closest_pt - obs_p)[:2])
-                    
-                    if dist_to_obs < clearance and s < min_s:
-                        min_s = s
-                        hit_obs_idx = idx
-                        hit_closest_pt = closest_pt
-                            
-                if hit_obs_idx != -1:
-                    obs_p = obstacles_pos[hit_obs_idx]
-                    is_frame = hit_obs_idx >= num_regular_obstacles
-                    
-                    # 2. Dynamic push distance based on segment length
-                    base_push = 0.2
-                    segment_length = np.sqrt(len3d_sq) if len3d_sq > 0 else 0
-                    push_dist = base_push + (segment_length * 0.05)
-                    
-                    push_dir = hit_closest_pt - obs_p
-                    
-                    # For cylinders, we usually only push horizontally. 
-                    if not is_frame:
-                        push_dir[2] = 0 
-                    
-                    # ARITHMETIC FIX: Always normalize the push direction!
-                    norm_val = np.linalg.norm(push_dir)
-                    if norm_val > 1e-6:
-                        push_dir = push_dir / norm_val
-                    else:
-                        # Fallback if center hit exactly perfectly
-                        push_dir = np.array([1.0, 0.0, 0.0]) 
+                        local[2] = np.sign(local[2] or 1.0) * GATE_PUSH_OUT
+                    path[j] = gp + gate_rots[gi].apply(local)
+                    pt = path[j]
+                # Stand under the gate (thin column below the centre).
+                if (
+                    local[2] < -0.30
+                    and abs(local[0]) < 0.08
+                    and abs(local[1]) < 0.08
+                ):
+                    local[1] = np.sign(local[1] or 1.0) * 0.20
+                    path[j] = gp + gate_rots[gi].apply(local)
+                    pt = path[j]
 
-                    if not is_frame and push_dir[2] > 0:
-                        # If doing 3D push, re-normalize after vertical bias
-                        push_dir[2] *= 1.1
-                        push_dir = push_dir / np.linalg.norm(push_dir)
-                        
-                    # 3. Calculate backward pull vector
-                    back_dir = start - hit_closest_pt
-                    back_norm = np.linalg.norm(back_dir)
-                    if back_norm > 1e-6:
-                        back_dir = back_dir / back_norm
-                    else:
-                        back_dir = np.zeros(3)
-                        
-                    # Combine outward push with backward bias for a safe approach angle
-                    diversion = hit_closest_pt + (push_dir * push_dist) + (back_dir * 0.2)                    
-                    diversion[2] = max(0.8, diversion[2])
-                    
-                    left_path = resolve_segment(start, diversion, depth + 1)
-                    right_path = resolve_segment(diversion, end, depth + 1)
-                    
-                    return left_path + [diversion] + right_path
+        # Phase 1: push-only iterations — let the path bow around obstacles freely.
+        for _ in range(RELAX_ITERS):
+            for j in range(1, len(path) - 1):
+                if j in gate_locked_set:
+                    continue
+                push_point(j)
+
+        # Phase 2: alternate light smoothing with pushing so corners don't kink.
+        for _ in range(RELAX_ITERS):
+            new_inner = (
+                SMOOTH_W_NEIGHBOR * path[:-2]
+                + (1.0 - 2.0 * SMOOTH_W_NEIGHBOR) * path[1:-1]
+                + SMOOTH_W_NEIGHBOR * path[2:]
+            )
+            for j in range(1, len(path) - 1):
+                if j in gate_locked_set:
+                    continue
+                # Enforce closeness to original path
+                if has_ref and valid_ref[j]:
+                    path[j] = (1.0 - SMOOTH_W_REF) * new_inner[j - 1] + SMOOTH_W_REF * ref_points[j]
                 else:
-                    return []
+                    path[j] = new_inner[j - 1]
 
-            # Apply collision resolution uniformly to all segments
-            # Skip collision check for segments that are part of a gate passage (same gate index)
-            idxA = waypoints[i-1][1] if i>0 else -1
-            idxB = waypoints[i][1]
-            if (idxA != idxB) or idxA==-1  :
-                diversions = resolve_segment(pA, pB)
-                safe_waypoints.extend(diversions)
+            for j in range(1, len(path) - 1):
+                if j in gate_locked_set:
+                    continue
+                # Prevent sharp U-turns dynamically by flattening tight angles
+                v1 = path[j] - path[j - 1]
+                v2 = path[j + 1] - path[j]
+                n1, n2 = float(np.linalg.norm(v1)), float(np.linalg.norm(v2))
+                if n1 > 1e-4 and n2 > 1e-4 and np.dot(v1 / n1, v2 / n2) < 0.0:
+                    path[j] = 0.5 * path[j] + 0.25 * path[j - 1] + 0.25 * path[j + 1]
 
-            safe_waypoints.append(pB)
+            for j in range(1, len(path) - 1):
+                if j in gate_locked_set:
+                    continue
+                push_point(j)
 
-        fw = np.array(safe_waypoints)
-        
-        diffs = np.linalg.norm(np.diff(fw, axis=0), axis=1)
-        valid_mask = np.insert(diffs > 0.05, 0, True)
-        fw = fw[valid_mask]
-        
-        if len(fw) < 2:
+        # Phase 3: final push-only to guarantee clearance after the last smoothing.
+        for _ in range(RELAX_ITERS):
+            for j in range(1, len(path) - 1):
+                if j in gate_locked_set:
+                    continue
+                # Unbend sharp U-turns before pushing to ensure clearance takes precedence
+                v1 = path[j] - path[j - 1]
+                v2 = path[j + 1] - path[j]
+                n1, n2 = float(np.linalg.norm(v1)), float(np.linalg.norm(v2))
+                if n1 > 1e-4 and n2 > 1e-4 and np.dot(v1 / n1, v2 / n2) < 0.0:
+                    path[j] = 0.5 * path[j] + 0.25 * path[j - 1] + 0.25 * path[j + 1]
+                    
+                push_point(j)
+
+        # 4. Drop near-duplicate points so stays well-conditioned.
+        diffs = np.linalg.norm(np.diff(path, axis=0), axis=1)
+        keep = np.concatenate(([True], diffs > 1e-3))
+        path = path[keep]
+        if len(path) < 2:
             self._finished = True
             return
 
-        # 3. Time Allocation based on Segment Distances
-        dists = np.linalg.norm(np.diff(fw, axis=0), axis=1)
-        cum_dists = np.insert(np.cumsum(dists), 0, 0.0)
-        total_dist = cum_dists[-1]
-        
-        curr_time = self._tick / self._freq
-        rem_budget = max(1.0, self._total_budget - curr_time)
-        
-        if total_dist > 1e-4:
-            ft = (cum_dists / total_dist) * rem_budget
-        else:
-            ft = np.linspace(0, rem_budget, len(fw))
-            
-        for i in range(1, len(ft)):
-            if ft[i] <= ft[i-1]:
-                ft[i] = ft[i-1] + 1e-3
+        # 5. Time parameterize using arclength / target speed.
+        dists = np.linalg.norm(np.diff(path, axis=0), axis=1)
+        cum = np.insert(np.cumsum(dists), 0, 0.0)
+        times = cum / TARGET_SPEED
+        valid = np.concatenate(([True], np.diff(times) > 1e-3))
+        times = times[valid]
+        path = path[valid]
+        if len(path) < 2:
+            self._finished = True
+            return
 
+        self._spline = CubicSpline(times, path, bc_type='natural')
+        self._t_total = float(times[-1])
+        self._t_offset = self._tick / self._freq
+        self._last_target = target
+        self._last_replan_path = path.copy()
+        self._last_replan_tick = self._tick
 
-        self._t_total = ft[-1]
-        self._des_pos_spline = PchipInterpolator(ft, fw)
-        self._t_offset = curr_time
-        self._last_replan_time = curr_time
-        self._last_target_gate = target_gate
-        self._current_combined_obstacles = obstacles_pos
-
+    # ------------------------------------------------------------- main loop
     def compute_control(
-            self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
-        ) -> NDArray[np.floating]:
-        target_gate = int(obs["target_gate"])
-        obstacles_visited = np.array(obs["obstacles_visited"], dtype=bool)
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
+    ) -> NDArray[np.floating]:
+        target = int(obs["target_gate"])
+        obs_visited = np.asarray(obs["obstacles_visited"], dtype=bool)
 
-        drone_pos = np.array(obs["pos"], dtype=np.float64).flatten()[:3]
-        gates_pos = np.array(obs["gates_pos"], dtype=np.float64)
-        gates_quat = np.array(obs["gates_quat"], dtype=np.float64)
-
+        # Trigger a replan when state changes meaningfully.
         replan = False
-        dist_past = float("inf")
-        curr_time = self._tick / self._freq
+        if  self._tick==5 or self._tick==2 or self._tick==400 :
+            print("initial replan")
+            replan=True
+        if self._last_obs_visited is not None and np.any(obs_visited & ~self._last_obs_visited):
+            replan = True
+        if replan:
+            self._build_trajectory(obs)
+        self._last_obs_visited = obs_visited
 
-        t_s = np.clip(self._tick / self._freq - self._t_offset, 0.0, self._t_total)
+        action = np.zeros(13, dtype=np.float32)
+        if self._finished or self._spline is None:
+            action[:3] = np.asarray(obs["pos"]).flatten()[:3]
+            return action
+
+        t_s = float(np.clip(self._tick / self._freq - self._t_offset, 0.0, self._t_total))
         if t_s >= self._t_total:
             self._finished = True
 
-        des_pos = self._des_pos_spline(t_s)
-        height_offset = 0.1
-        des_pos[2] -= height_offset
-        
-        # Initialize an obstacle tracking set if it doesn't exist yet
-        if not hasattr(self, "_recalculated_obstacles"):
-            self._recalculated_obstacles = set()
-        
-        # Check proximity to obstacles to slow down for precision near hazards
-        dist_to_obs = float("inf")
-        if hasattr(self, "_current_combined_obstacles") and self._current_combined_obstacles.size > 0:
-            # Using 2D distance for pillars and passed gate centers as a safety heuristic
-            obs_dists = np.linalg.norm(self._current_combined_obstacles[:, :2] - drone_pos[:2], axis=1)
-            closest_obs_idx = int(np.argmin(obs_dists))
-            dist_to_obs = obs_dists[closest_obs_idx]
-            
-            # Replan the first time we are closer than 0.7m to this specific obstacle
-            if dist_to_obs < 0.6 and closest_obs_idx not in self._recalculated_obstacles:
-                replan = True
-                self._recalculated_obstacles.add(closest_obs_idx)
-
-        drone_pos_f32 = np.array(obs["pos"], dtype=np.float32).flatten()[:3]
-        target_vec = des_pos - drone_pos_f32
-        dist = np.linalg.norm(target_vec)
-    
-                
-        dist_to_target = float("inf")
-        if not replan and 0 <= target_gate < self._n_gates:
-            target_gp = gates_pos[target_gate].flatten()[:3]
-            dist_to_target = np.linalg.norm(drone_pos - target_gp)
-            
-            if dist_to_target < 0.6 and self._recalculated_for_approach != target_gate:
-                replan = True
-                self._recalculated_for_approach = target_gate
-
-        # Reduce max_dist when near gates or obstacles to improve tracking precision
-        max_dist = 15.0 if (dist_to_target > 0.8 and dist_past > 0.8 and dist_to_obs > 0.8) else 15
-
-        if replan:
-            self._build_trajectory(obs)
-                
-        self._last_obstacles_visited = obstacles_visited
-
-        if self._finished or self._des_pos_spline is None:
-            return np.zeros(13, dtype=np.float32)
-            
-        
-        if dist > max_dist:
-            des_pos = drone_pos_f32 + (target_vec / (dist + 1e-8)) * max_dist
-            if dist > max_dist * 1.2:
-                self._t_offset += 1.0 / self._freq
-        
-        t_lookahead = np.clip(t_s + 0.1, 0.0, self._t_total)
-        raw_spline_pos = self._des_pos_spline(t_s)
-        delta = self._des_pos_spline(t_lookahead) - raw_spline_pos
+        des_pos = self._spline(t_s)
+        des_pos[2] -= 0.1  # fly slightly below the path for better clearance and to prevent overshooting
+        t_look = float(np.clip(t_s + 0.1, 0.0, self._t_total))
+        delta = self._spline(t_look) - des_pos
         des_yaw = float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta[:2]) > 1e-2 else 0.0
 
-        action = np.zeros(13, dtype=np.float32)
-        
         action[0:3] = des_pos
-        action[9] = des_yaw 
+        action[9] = des_yaw
         return action
 
+    # --------------------------------------------------------------- callbacks
     def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
         self._tick += 1
+        if terminated or truncated:
+            self._dump_path(obs, info, terminated=terminated, truncated=truncated)
         return self._finished
 
     def episode_callback(self):
@@ -388,25 +350,47 @@ class AdaptiveController(Controller):
     def episode_reset(self):
         self._tick = 0
         self._finished = False
-        self._last_target_gate = -2
-        self._recalculated_for_approach = -1
-        self._des_pos_spline = None
-        self._last_replan_time = 0.0
-        self.cleared_gates = []             # Ensures clean slate per episode
-        self._cleared_last_gate = True      # Reset gate logic flag
+        self._spline = None
+        self._t_total = 0.0
+        self._t_offset = 0.0
+        self._last_target = -2
+        self._last_obs_visited = None
+        self._last_replan_path = None
+        self._episode_idx += 1
 
     def render_callback(self, sim: Sim):
-        if self._des_pos_spline is None:
+        if self._spline is None:
             return
         try:
             from crazyflow.sim.visualize import draw_line, draw_points
-            t_s = np.clip(self._tick / self._freq - self._t_offset, 0.0, self._t_total)
-            draw_points(sim, self._des_pos_spline(t_s).reshape(1, -1), rgba=(1, 0, 0, 1), size=0.03)
-            draw_line(sim, self._des_pos_spline(np.linspace(0, self._t_total, 100)), rgba=(0, 1, 0, 1))
-            
-            if hasattr(self, "_current_combined_obstacles"):
-                obs_pts = np.array(self._current_combined_obstacles)
-                if obs_pts.size > 0:
-                    draw_points(sim, obs_pts, rgba=(1, 1, 0, 0.5), size=0.1)
+
+            t_s = float(np.clip(self._tick / self._freq - self._t_offset, 0.0, self._t_total))
+            draw_points(sim, self._spline(t_s).reshape(1, -1), rgba=(1, 0, 0, 1), size=0.03)
+            draw_line(sim, self._spline(np.linspace(0, self._t_total, 100)), rgba=(0, 1, 0, 1))
         except ImportError:
             pass
+
+    # ------------------------------------------------------------ diagnostics
+    def _dump_path(self, obs: dict, info: dict | None, *, terminated: bool, truncated: bool) -> None:
+        """Write the most recent planned path + run summary when the episode ends."""
+        if self._last_replan_path is None:
+            return
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "episode": self._episode_idx,
+                "tick_at_end": int(self._tick),
+                "terminated": bool(terminated),
+                "truncated": bool(truncated),
+                "target_gate_at_end": int(obs.get("target_gate", -1)),
+                "drone_pos_at_end": np.asarray(obs["pos"]).flatten()[:3].tolist(),
+                "last_replan_tick": int(self._last_replan_tick),
+                "path_xyz": self._last_replan_path.tolist(),
+                "collision": bool(info.get("collision")) if info else False,
+            }
+            fpath = LOG_DIR / f"path_ep{self._episode_idx:03d}.json"
+            with fpath.open("w") as f:
+                json.dump(payload, f, indent=2)
+            print(f"[adaptive_v2] Wrote planned path to {fpath}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[adaptive_v2] Failed to dump path: {exc}")
