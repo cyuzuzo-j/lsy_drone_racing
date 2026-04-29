@@ -30,21 +30,23 @@ if TYPE_CHECKING:
 GATE_INNER_HALF = 0.20  # half-width of the open square inside the gate frame
 # half-width of the outer frame (bar centre is at 0.28, half-extent 0.08)
 GATE_FRAME_HALF = 0.36
-GATE_PLATE_HALF = 0.3  # along the gate axis: thickness of the plane to treat as "in frame"
-GATE_OPENING_MARGIN = 0.3  # corridor half-width considered safe for passage
-GATE_PUSH_OUT = 1.0  # where to push points that intrude on a bar
+GATE_PLATE_HALF = 0.2  # along the gate axis: thickness of the plane to treat as "in frame"
+GATE_OPENING_MARGIN = 0.2  # corridor half-width considered safe for passage
+GATE_PUSH_OUT = 1.0 # where to push points that intrude on a bar
 # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
-POST_RADIUS_CLEARANCE = 0.22
+POST_RADIUS_CLEARANCE = 0.3
 POST_TOP_Z = 1.90  # posts extend roughly from the ground to this height
 APPROACH_DIST = 0.4  # offset of the approach waypoint in front of a gate
 EXIT_DIST = 0.4  # offset of the exit waypoint behind a gate
 PATH_SAMPLE_STEP = 0.1  # densification step for the polyline (m)
 RELAX_ITERS = 20  # avoidance / smoothing passes
 SMOOTH_W_SELF = 0.8  # smoothing weights — higher self => weaker smoothing
-SMOOTH_W_NEIGHBOR = 0.2
+SMOOTH_W_NEIGHBOR = 0.0
 SMOOTH_W_REF = 0.6  # attraction weight to the previous path to enforce consistency
-TARGET_SPEED = 0.44  # m/s, used to time-parameterize the path
+TARGET_SPEED = 0.8  # m/s, used to time-parameterize the path
 GATE_REPLAN_DIST = 0.7  # replan when first entering this radius around each gate (m)
+GATE2_APPROACH_SPEED = 0.5  # reduced speed through gate 2 (tight gap)
+GATE2_SLOW_RADIUS = 0.8  # m from gate 2 centre over which the slowdown applies
 LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
 
 
@@ -99,9 +101,11 @@ class AdaptiveController(Controller):
 
         # 1. Build a clean waypoint list with consistent flight direction.
         wps: list[np.ndarray] = [drone_pos.copy()]
-        # Optional velocity-aligned anchor so the spline doesn't whip back when replanning.
-        if np.linalg.norm(drone_vel) > 0.4:
-            wps.append(drone_pos + self._safe_normalize(drone_vel) * 0.15)
+        # Velocity-aligned anchor: scale lookahead with speed so faster flight stays tangent longer.
+        speed = float(np.linalg.norm(drone_vel))
+        if speed > 0.4:
+            anchor_dist = max(0.2, speed * 0.35)
+            wps.append(drone_pos + self._safe_normalize(drone_vel) * anchor_dist)
 
         cur_pt = wps[-1].copy()
         for i in range(target, self._n_gates):
@@ -145,6 +149,7 @@ class AdaptiveController(Controller):
             elif i == 2:
                 wps.append(g + axis * 0.1)
                 wps.append(g - axis * 0.3)
+
             elif i == 3:
                 wps.append(g + axis * 5)
             elif i == 4:
@@ -289,10 +294,16 @@ class AdaptiveController(Controller):
             self._finished = True
             return
 
-        # 5. Time parameterize using arclength / target speed.
+        # 5. Time parameterize with a per-segment speed profile.
+        # Segments within GATE2_SLOW_RADIUS of gate 2 use a lower speed so the
+        # controller has more time to thread the tight gap.
         dists = np.linalg.norm(np.diff(path, axis=0), axis=1)
-        cum = np.insert(np.cumsum(dists), 0, 0.0)
-        times = cum / TARGET_SPEED
+        seg_speeds = np.full(len(dists), TARGET_SPEED)
+        if 2 in future_gates:
+            midpoints = 0.5 * (path[:-1] + path[1:])
+            near_g2 = np.linalg.norm(midpoints - gates_pos[2, :3], axis=1) < GATE2_SLOW_RADIUS
+            seg_speeds[near_g2] = GATE2_APPROACH_SPEED
+        times = np.insert(np.cumsum(dists / seg_speeds), 0, 0.0)
         valid = np.concatenate(([True], np.diff(times) > 1e-3))
         times = times[valid]
         path = path[valid]
@@ -300,7 +311,14 @@ class AdaptiveController(Controller):
             self._finished = True
             return
 
-        self._spline = CubicSpline(times, path, bc_type="natural")
+        # Clamp the initial derivative to the drone's current velocity direction so the new
+        # trajectory leaves smoothly in the direction of travel instead of curling back.
+        speed = float(np.linalg.norm(drone_vel))
+        if speed > 0.2:
+            start_deriv = self._safe_normalize(drone_vel) * TARGET_SPEED
+        else:
+            start_deriv = np.zeros(3)
+        self._spline = CubicSpline(times, path, bc_type=((1, start_deriv), (1, np.zeros(3))))
         self._t_total = float(times[-1])
         self._t_offset = self._tick / self._freq
         self._last_target = target
@@ -317,8 +335,6 @@ class AdaptiveController(Controller):
 
         # Trigger a replan when state changes meaningfully.
         replan = False
-        if self._tick == 15:
-            replan = True
         # Replan the first time we enter the 0.7 m approach radius of each gate.
         drone_pos = np.asarray(obs["pos"], dtype=np.float64).flatten()[:3]
         gates_pos = np.asarray(obs["gates_pos"], dtype=np.float64)
