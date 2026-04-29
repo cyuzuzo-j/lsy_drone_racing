@@ -111,14 +111,12 @@ class AdaptiveController(Controller):
             # Test both entrance directions to minimize cost to the next gate
             g_next = gates_pos[i, :3]
             if not self.directions_set:
-                cost_plus = (
-                    np.linalg.norm((g - axis * APPROACH_DIST) - cur_pt)
-                    + np.linalg.norm(g_next - g)
+                cost_plus = np.linalg.norm((g - axis * APPROACH_DIST) - cur_pt) + np.linalg.norm(
+                    g_next - g
                 )
-                cost_minus = (
-                    np.linalg.norm((g - (-axis) * APPROACH_DIST) - cur_pt)
-                    + np.linalg.norm(g_next - g)
-                )
+                cost_minus = np.linalg.norm(
+                    (g - (-axis) * APPROACH_DIST) - cur_pt
+                ) + np.linalg.norm(g_next - g)
                 if cost_minus < cost_plus:
                     axis = -axis
                 self.directions[i] = axis
@@ -210,8 +208,7 @@ class AdaptiveController(Controller):
                 gp = gates_pos[gi, :3]
                 local = gate_rots[gi].inv().apply(pt - gp)
                 in_opening = (
-                    abs(local[1]) < GATE_OPENING_MARGIN
-                    and abs(local[2]) < GATE_OPENING_MARGIN
+                    abs(local[1]) < GATE_OPENING_MARGIN and abs(local[2]) < GATE_OPENING_MARGIN
                 )
                 if gi in future_gates and in_opening:
                     continue
@@ -227,11 +224,7 @@ class AdaptiveController(Controller):
                     path[j] = gp + gate_rots[gi].apply(local)
                     pt = path[j]
                 # Stand under the gate (thin column below the centre).
-                if (
-                    local[2] < -0.30
-                    and abs(local[0]) < 0.08
-                    and abs(local[1]) < 0.08
-                ):
+                if local[2] < -0.30 and abs(local[0]) < 0.08 and abs(local[1]) < 0.08:
                     local[1] = np.sign(local[1] or 1.0) * 0.20
                     path[j] = gp + gate_rots[gi].apply(local)
                     pt = path[j]
@@ -255,9 +248,7 @@ class AdaptiveController(Controller):
                     continue
                 # Enforce closeness to original path
                 if has_ref and valid_ref[j]:
-                    path[j] = (
-                        (1.0 - SMOOTH_W_REF) * new_inner[j - 1] + SMOOTH_W_REF * ref_points[j]
-                    )
+                    path[j] = (1.0 - SMOOTH_W_REF) * new_inner[j - 1] + SMOOTH_W_REF * ref_points[j]
                 else:
                     path[j] = new_inner[j - 1]
 
@@ -355,9 +346,7 @@ class AdaptiveController(Controller):
         des_pos[2] -= 0.1  # fly slightly below the path for better clearance
         t_look = float(np.clip(t_s + 0.1, 0.0, self._t_total))
         delta = self._spline(t_look) - des_pos
-        des_yaw = (
-            float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta[:2]) > 1e-2 else 0.0
-        )
+        des_yaw = float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta[:2]) > 1e-2 else 0.0
 
         action[0:3] = des_pos
         action[9] = des_yaw
@@ -411,12 +400,7 @@ class AdaptiveController(Controller):
 
     # ------------------------------------------------------------ diagnostics
     def _dump_path(
-        self,
-        obs: dict,
-        info: dict | None,
-        *,
-        terminated: bool,
-        truncated: bool,
+        self, obs: dict, info: dict | None, *, terminated: bool, truncated: bool
     ) -> None:
         """Write the most recent planned path + run summary when the episode ends."""
         if self._last_replan_path is None:
