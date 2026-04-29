@@ -43,7 +43,7 @@ RELAX_ITERS = 20  # avoidance / smoothing passes
 SMOOTH_W_SELF = 0.8  # smoothing weights — higher self => weaker smoothing
 SMOOTH_W_NEIGHBOR = 0.2
 SMOOTH_W_REF = 0.6  # attraction weight to the previous path to enforce consistency
-TARGET_SPEED = 0.5  # m/s, used to time-parameterize the path
+TARGET_SPEED = 0.44  # m/s, used to time-parameterize the path
 GATE_REPLAN_DIST = 0.7  # replan when first entering this radius around each gate (m)
 LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
 
