@@ -32,7 +32,7 @@ GATE_FRAME_HALF = 0.36      # half-width of the outer frame (bar centre is at 0.
 GATE_PLATE_HALF = 0.3      # along the gate axis: thickness of the plane to treat as "in frame"
 GATE_OPENING_MARGIN = 0.3  # corridor half-width considered safe for passage
 GATE_PUSH_OUT = 1.0      # where to push points that intrude on a bar
-POST_RADIUS_CLEARANCE = 0.25  # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
+POST_RADIUS_CLEARANCE = 0.22  # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
 POST_TOP_Z = 1.90           # posts extend roughly from the ground to this height
 APPROACH_DIST = 0.4        # offset of the approach waypoint in front of a gate
 EXIT_DIST = 0.4         # offset of the exit waypoint behind a gate
@@ -41,12 +41,16 @@ RELAX_ITERS = 20            # avoidance / smoothing passes
 SMOOTH_W_SELF = 0.8        # smoothing weights — higher self => weaker smoothing
 SMOOTH_W_NEIGHBOR = 0.2
 SMOOTH_W_REF = 0.6         # attraction weight to the previous path to enforce consistency
-TARGET_SPEED = 0.35 # m/s, used to time-parameterize the path
+TARGET_SPEED = 0.35  # m/s, used to time-parameterize the path
+GATE_REPLAN_DIST = 0.7  # replan when first entering this radius around each gate (m)
 LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
 
 
 class AdaptiveController(Controller):
     """Gate-aware controller that dynamically re-plans through observed gates."""
+
+    directions_set = False
+    directions = [0, 0, 0, 0, 0]
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         super().__init__(obs, info, config)
@@ -62,6 +66,7 @@ class AdaptiveController(Controller):
         self._last_replan_path = None
         self._last_replan_tick = -10_000
         self._episode_idx = 0
+        self._gate_proximity_triggered = np.zeros(self._n_gates, dtype=bool)
         self._build_trajectory(obs)
 
     # ------------------------------------------------------------------ utils
@@ -100,41 +105,43 @@ class AdaptiveController(Controller):
         for i in range(target, self._n_gates):
             g = gates_pos[i, :3]
             axis = self._gate_forward(gates_quat[i])
-            
+
             # Test both entrance directions to minimize cost to the next gate
             g_next = gates_pos[i, :3]
-            cost_plus = np.linalg.norm((g - axis * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
-            cost_minus = np.linalg.norm((g - (-axis) * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
-            if cost_minus < cost_plus:
-                axis = -axis
+            if not self.directions_set:
+                cost_plus = np.linalg.norm((g - axis * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
+                cost_minus = np.linalg.norm((g - (-axis) * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
+                if cost_minus < cost_plus:
+                    axis = -axis
+                self.directions[i] = axis
+            else:
+                axis = self.directions[i]
 
             # Shrink approach if we are already inside it.
             d = np.linalg.norm(g - cur_pt)
             if i == 0:
                 app_d = min(0.4, max(0, d * 0.5))
-
-            elif i ==1 :
+            elif i == 1:
                 app_d = min(1.5, max(0.5, d * 0.5))
-            elif i == 2 :
+            elif i == 2:
                 app_d = min(0.5, max(0, d * 0.5))
-            elif i == 3 :
+            elif i == 3:
                 app_d = min(0.2, max(0, d * 0.5))
             else:
                 app_d = 0.4
-                
+
             wps.append(g - axis * app_d)
             wps.append(g.copy())
             if i == 0:
                 wps.append(g + axis * 0.6)
-            elif i ==1 :
+            elif i == 1:
                 wps.append(g + axis * 0.6)
-            elif i == 2 :
+            elif i == 2:
                 wps.append(g + axis * 0.1)
                 wps.append(g - axis * 0.3)
-
-            elif i == 3 :
+            elif i == 3:
                 wps.append(g + axis * 5)
-            elif i == 4 :
+            elif i == 4:
                 wps.append(g + axis * EXIT_DIST)
             prev_dir = axis
             cur_pt = wps[-1]
@@ -155,7 +162,7 @@ class AdaptiveController(Controller):
             seg_len = np.linalg.norm(p2 - p1)
             n = max(2, int(np.ceil(seg_len / PATH_SAMPLE_STEP)))
             wp_positions.append(wp_positions[-1] + (n - 1))
-            
+
         anchor_count = len(wps) - 3 * (self._n_gates - target)
         gate_locked_idxs: list[int] = []
         for k in range(self._n_gates - target):
@@ -170,7 +177,7 @@ class AdaptiveController(Controller):
         future_gates = list(range(target, self._n_gates))
         gate_rots = [R.from_quat(gates_quat[gi]) for gi in range(self._n_gates)]
 
-        # Find closest points on the previously planned path to act as strong attractors 
+        # Find closest points on the previously planned path to act as strong attractors
         has_ref = self._last_replan_path is not None
         if has_ref:
             dists = cdist(path, self._last_replan_path)
@@ -271,7 +278,7 @@ class AdaptiveController(Controller):
                 n1, n2 = float(np.linalg.norm(v1)), float(np.linalg.norm(v2))
                 if n1 > 1e-4 and n2 > 1e-4 and np.dot(v1 / n1, v2 / n2) < 0.0:
                     path[j] = 0.5 * path[j] + 0.25 * path[j - 1] + 0.25 * path[j + 1]
-                    
+
                 push_point(j)
 
         # 4. Drop near-duplicate points so stays well-conditioned.
@@ -299,6 +306,7 @@ class AdaptiveController(Controller):
         self._last_target = target
         self._last_replan_path = path.copy()
         self._last_replan_tick = self._tick
+        self.directions_set = True
 
     # ------------------------------------------------------------- main loop
     def compute_control(
@@ -309,9 +317,16 @@ class AdaptiveController(Controller):
 
         # Trigger a replan when state changes meaningfully.
         replan = False
-        if  self._tick==20  or self._tick==400 :
-            print("initial replan")
-            replan=True
+        if self._tick == 15:
+            replan = True
+        # Replan the first time we enter the 0.7 m approach radius of each gate.
+        drone_pos = np.asarray(obs["pos"], dtype=np.float64).flatten()[:3]
+        gates_pos = np.asarray(obs["gates_pos"], dtype=np.float64)
+        for gi in range(self._n_gates):
+            if not self._gate_proximity_triggered[gi]:
+                if float(np.linalg.norm(gates_pos[gi, :3] - drone_pos)) < GATE_REPLAN_DIST:
+                    self._gate_proximity_triggered[gi] = True
+                    replan = True
         if self._last_obs_visited is not None and np.any(obs_visited & ~self._last_obs_visited):
             replan = True
         if replan:
@@ -357,6 +372,7 @@ class AdaptiveController(Controller):
         self._last_obs_visited = None
         self._last_replan_path = None
         self._episode_idx += 1
+        self._gate_proximity_triggered = np.zeros(self._n_gates, dtype=bool)
 
     def render_callback(self, sim: Sim):
         if self._spline is None:
