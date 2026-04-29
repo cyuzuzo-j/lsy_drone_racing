@@ -43,9 +43,9 @@ RELAX_ITERS = 10  # avoidance / smoothing passes
 SMOOTH_W_SELF = 0.99  # smoothing weights — higher self => weaker smoothing
 SMOOTH_W_NEIGHBOR = 0.
 SMOOTH_W_REF = 0.2  # attraction weight to the previous path to enforce consistency
-TARGET_SPEED = 0.4 # m/s, used to time-parameterize the path
+TARGET_SPEED = 0.35 # m/s, used to time-parameterize the path
 GATE_REPLAN_DIST = 0.7  # replan when first entering this radius around each gate (m)
-GATE2_APPROACH_SPEED = 0.5  # reduced speed through gate 2 (tight gap)
+GATE2_APPROACH_SPEED = 0.35  # reduced speed through gate 2 (tight gap)
 GATE2_SLOW_RADIUS = 0.8  # m from gate 2 centre over which the slowdown applies
 LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
 
@@ -72,6 +72,8 @@ class AdaptiveController(Controller):
         self._last_replan_tick = -10_000
         self._episode_idx = 0
         self._gate_proximity_triggered = np.zeros(self._n_gates, dtype=bool)
+        # Extra "1 m before" replan triggers for gates 0 and 1 (along approach axis).
+        self._gate_pre1m_triggered = np.zeros(self._n_gates, dtype=bool)
         self._build_trajectory(obs)
 
     # ------------------------------------------------------------------ utils
@@ -387,6 +389,19 @@ class AdaptiveController(Controller):
                 if d < GATE_REPLAN_DIST:
                     self._gate_proximity_triggered[gi] = True
                     replan = True
+        # Extra one-shot replans 1 m in front of gates 0 and 1 (measured along the
+        # gate's approach axis, so it only fires on the entry side).
+        for gi in (0, 1):
+            if gi >= self._n_gates or self._gate_pre1m_triggered[gi]:
+                continue
+            axis = self.directions[gi] if self.directions_set else self._gate_forward(gates_quat[gi])
+            if not isinstance(axis, np.ndarray):
+                continue
+            s = float(np.dot(drone_pos - gates_pos[gi, :3], axis))
+            # s ~ -1 m means the drone is 1 m in front of the gate along its flight axis.
+            if -1.05 < s < -0.95:
+                self._gate_pre1m_triggered[gi] = True
+                replan = True
         if self._last_obs_visited is not None and np.any(obs_visited & ~self._last_obs_visited):
             replan = True
         if replan:
@@ -444,6 +459,7 @@ class AdaptiveController(Controller):
         self._last_replan_path = None
         self._episode_idx += 1
         self._gate_proximity_triggered = np.zeros(self._n_gates, dtype=bool)
+        self._gate_pre1m_triggered = np.zeros(self._n_gates, dtype=bool)
 
     def render_callback(self, sim: Sim) -> None:
         """Draw the planned path in the simulator GUI."""
