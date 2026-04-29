@@ -27,20 +27,22 @@ if TYPE_CHECKING:
 
 
 # Geometry constants (meters).
-GATE_INNER_HALF = 0.20      # half-width of the open square inside the gate frame
-GATE_FRAME_HALF = 0.36      # half-width of the outer frame (bar centre is at 0.28, half-extent 0.08)
-GATE_PLATE_HALF = 0.3      # along the gate axis: thickness of the plane to treat as "in frame"
+GATE_INNER_HALF = 0.20  # half-width of the open square inside the gate frame
+# half-width of the outer frame (bar centre is at 0.28, half-extent 0.08)
+GATE_FRAME_HALF = 0.36
+GATE_PLATE_HALF = 0.3  # along the gate axis: thickness of the plane to treat as "in frame"
 GATE_OPENING_MARGIN = 0.3  # corridor half-width considered safe for passage
-GATE_PUSH_OUT = 1.0      # where to push points that intrude on a bar
-POST_RADIUS_CLEARANCE = 0.22  # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
-POST_TOP_Z = 1.90           # posts extend roughly from the ground to this height
-APPROACH_DIST = 0.4        # offset of the approach waypoint in front of a gate
-EXIT_DIST = 0.4         # offset of the exit waypoint behind a gate
-PATH_SAMPLE_STEP = 0.1     # densification step for the polyline (m)
-RELAX_ITERS = 20            # avoidance / smoothing passes
-SMOOTH_W_SELF = 0.8        # smoothing weights — higher self => weaker smoothing
+GATE_PUSH_OUT = 1.0  # where to push points that intrude on a bar
+# 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
+POST_RADIUS_CLEARANCE = 0.22
+POST_TOP_Z = 1.90  # posts extend roughly from the ground to this height
+APPROACH_DIST = 0.4  # offset of the approach waypoint in front of a gate
+EXIT_DIST = 0.4  # offset of the exit waypoint behind a gate
+PATH_SAMPLE_STEP = 0.1  # densification step for the polyline (m)
+RELAX_ITERS = 20  # avoidance / smoothing passes
+SMOOTH_W_SELF = 0.8  # smoothing weights — higher self => weaker smoothing
 SMOOTH_W_NEIGHBOR = 0.2
-SMOOTH_W_REF = 0.6         # attraction weight to the previous path to enforce consistency
+SMOOTH_W_REF = 0.6  # attraction weight to the previous path to enforce consistency
 TARGET_SPEED = 0.5  # m/s, used to time-parameterize the path
 GATE_REPLAN_DIST = 0.7  # replan when first entering this radius around each gate (m)
 LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
@@ -53,6 +55,7 @@ class AdaptiveController(Controller):
     directions = [0, 0, 0, 0, 0]
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        """Initialize the controller and build the initial trajectory."""
         super().__init__(obs, info, config)
         self._freq = config.env.freq
         self._n_gates = len(config.env.track.gates)
@@ -100,7 +103,6 @@ class AdaptiveController(Controller):
         if np.linalg.norm(drone_vel) > 0.4:
             wps.append(drone_pos + self._safe_normalize(drone_vel) * 0.15)
 
-        prev_dir = self._safe_normalize(drone_vel) if np.linalg.norm(drone_vel) > 0.4 else None
         cur_pt = wps[-1].copy()
         for i in range(target, self._n_gates):
             g = gates_pos[i, :3]
@@ -109,8 +111,14 @@ class AdaptiveController(Controller):
             # Test both entrance directions to minimize cost to the next gate
             g_next = gates_pos[i, :3]
             if not self.directions_set:
-                cost_plus = np.linalg.norm((g - axis * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
-                cost_minus = np.linalg.norm((g - (-axis) * APPROACH_DIST) - cur_pt) + np.linalg.norm(g_next - g)
+                cost_plus = (
+                    np.linalg.norm((g - axis * APPROACH_DIST) - cur_pt)
+                    + np.linalg.norm(g_next - g)
+                )
+                cost_minus = (
+                    np.linalg.norm((g - (-axis) * APPROACH_DIST) - cur_pt)
+                    + np.linalg.norm(g_next - g)
+                )
                 if cost_minus < cost_plus:
                     axis = -axis
                 self.directions[i] = axis
@@ -143,7 +151,6 @@ class AdaptiveController(Controller):
                 wps.append(g + axis * 5)
             elif i == 4:
                 wps.append(g + axis * EXIT_DIST)
-            prev_dir = axis
             cur_pt = wps[-1]
 
         # 2. Densify into a polyline.
@@ -248,7 +255,9 @@ class AdaptiveController(Controller):
                     continue
                 # Enforce closeness to original path
                 if has_ref and valid_ref[j]:
-                    path[j] = (1.0 - SMOOTH_W_REF) * new_inner[j - 1] + SMOOTH_W_REF * ref_points[j]
+                    path[j] = (
+                        (1.0 - SMOOTH_W_REF) * new_inner[j - 1] + SMOOTH_W_REF * ref_points[j]
+                    )
                 else:
                     path[j] = new_inner[j - 1]
 
@@ -300,7 +309,7 @@ class AdaptiveController(Controller):
             self._finished = True
             return
 
-        self._spline = CubicSpline(times, path, bc_type='natural')
+        self._spline = CubicSpline(times, path, bc_type="natural")
         self._t_total = float(times[-1])
         self._t_offset = self._tick / self._freq
         self._last_target = target
@@ -312,7 +321,7 @@ class AdaptiveController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        target = int(obs["target_gate"])
+        """Compute the next control action."""
         obs_visited = np.asarray(obs["obstacles_visited"], dtype=bool)
 
         # Trigger a replan when state changes meaningfully.
@@ -343,26 +352,39 @@ class AdaptiveController(Controller):
             self._finished = True
 
         des_pos = self._spline(t_s)
-        des_pos[2] -= 0.1  # fly slightly below the path for better clearance and to prevent overshooting
+        des_pos[2] -= 0.1  # fly slightly below the path for better clearance
         t_look = float(np.clip(t_s + 0.1, 0.0, self._t_total))
         delta = self._spline(t_look) - des_pos
-        des_yaw = float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta[:2]) > 1e-2 else 0.0
+        des_yaw = (
+            float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta[:2]) > 1e-2 else 0.0
+        )
 
         action[0:3] = des_pos
         action[9] = des_yaw
         return action
 
     # --------------------------------------------------------------- callbacks
-    def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Update internal tick and dump path on episode end."""
         self._tick += 1
         if terminated or truncated:
             self._dump_path(obs, info, terminated=terminated, truncated=truncated)
         return self._finished
 
-    def episode_callback(self):
+    def episode_callback(self) -> None:
+        """Called at the end of each episode."""
         self.episode_reset()
 
-    def episode_reset(self):
+    def episode_reset(self) -> None:
+        """Reset all per-episode state."""
         self._tick = 0
         self._finished = False
         self._spline = None
@@ -374,7 +396,8 @@ class AdaptiveController(Controller):
         self._episode_idx += 1
         self._gate_proximity_triggered = np.zeros(self._n_gates, dtype=bool)
 
-    def render_callback(self, sim: Sim):
+    def render_callback(self, sim: Sim) -> None:
+        """Draw the planned path in the simulator GUI."""
         if self._spline is None:
             return
         try:
@@ -387,7 +410,14 @@ class AdaptiveController(Controller):
             pass
 
     # ------------------------------------------------------------ diagnostics
-    def _dump_path(self, obs: dict, info: dict | None, *, terminated: bool, truncated: bool) -> None:
+    def _dump_path(
+        self,
+        obs: dict,
+        info: dict | None,
+        *,
+        terminated: bool,
+        truncated: bool,
+    ) -> None:
         """Write the most recent planned path + run summary when the episode ends."""
         if self._last_replan_path is None:
             return
