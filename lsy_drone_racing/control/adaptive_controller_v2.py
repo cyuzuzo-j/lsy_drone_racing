@@ -32,7 +32,7 @@ GATE_FRAME_HALF = 0.36      # half-width of the outer frame (bar centre is at 0.
 GATE_PLATE_HALF = 0.3      # along the gate axis: thickness of the plane to treat as "in frame"
 GATE_OPENING_MARGIN = 0.3  # corridor half-width considered safe for passage
 GATE_PUSH_OUT = 1.0      # where to push points that intrude on a bar
-POST_RADIUS_CLEARANCE = 0.3  # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
+POST_RADIUS_CLEARANCE = 0.25  # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
 POST_TOP_Z = 1.90           # posts extend roughly from the ground to this height
 APPROACH_DIST = 0.4        # offset of the approach waypoint in front of a gate
 EXIT_DIST = 0.4         # offset of the exit waypoint behind a gate
@@ -114,7 +114,7 @@ class AdaptiveController(Controller):
                 app_d = min(0.4, max(0, d * 0.5))
 
             elif i ==1 :
-                app_d = min(1.5, max(0.15, d * 0.5))
+                app_d = min(1.5, max(0.5, d * 0.5))
             elif i == 2 :
                 app_d = min(0.5, max(0, d * 0.5))
             elif i == 3 :
@@ -309,7 +309,7 @@ class AdaptiveController(Controller):
 
         # Trigger a replan when state changes meaningfully.
         replan = False
-        if  self._tick==5 or self._tick==2 or self._tick==400 :
+        if  self._tick==20  or self._tick==400 :
             print("initial replan")
             replan=True
         if self._last_obs_visited is not None and np.any(obs_visited & ~self._last_obs_visited):
