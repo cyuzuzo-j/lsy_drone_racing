@@ -88,12 +88,8 @@ def simulate(
             controller_finished = controller.step_callback(
                 action, obs, reward, terminated, truncated, info
             )
-
+            # Add up reward, collisions
             if terminated or truncated or controller_finished:
-                print(f"DEBUG: Sim stopping at time {curr_time:.2f}s")
-                print(f"DEBUG: {terminated=}, {truncated=}, {controller_finished=}")
-                if "collision" in info and info["collision"]:
-                    print(f"DEBUG: Collision detected: {info['collision']}")
                 break
             if config.sim.render:  # Render the sim if selected.
                 if ((i * fps) % config.env.freq) < fps:
