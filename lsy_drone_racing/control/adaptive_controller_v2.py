@@ -32,7 +32,7 @@ GATE_INNER_HALF = 0.20  # half-width of the open square inside the gate frame
 GATE_FRAME_HALF = 0.36
 GATE_PLATE_HALF = 0.1  # along the gate axis: thickness of the plane to treat as "in frame"
 GATE_OPENING_MARGIN = 0.1  # corridor half-width considered safe for passage
-GATE_PUSH_OUT = 1.2 # where to push points that intrude on a bar
+GATE_PUSH_OUT = 0.1 # where to push points that intrude on a bar
 # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
 POST_RADIUS_CLEARANCE = 0.35
 POST_TOP_Z = 1.90  # posts extend roughly from the ground to this height
