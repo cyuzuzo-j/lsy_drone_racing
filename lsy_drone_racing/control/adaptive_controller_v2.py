@@ -30,22 +30,22 @@ if TYPE_CHECKING:
 GATE_INNER_HALF = 0.20  # half-width of the open square inside the gate frame
 # half-width of the outer frame (bar centre is at 0.28, half-extent 0.08)
 GATE_FRAME_HALF = 0.36
-GATE_PLATE_HALF = 0.2  # along the gate axis: thickness of the plane to treat as "in frame"
+GATE_PLATE_HALF = 0.1  # along the gate axis: thickness of the plane to treat as "in frame"
 GATE_OPENING_MARGIN = 0.2  # corridor half-width considered safe for passage
-GATE_PUSH_OUT = 1.0 # where to push points that intrude on a bar
+GATE_PUSH_OUT = 1.2 # where to push points that intrude on a bar
 # 2D clearance from cylindrical post obstacles (extra buffer for tracking error)
-POST_RADIUS_CLEARANCE = 0.2
+POST_RADIUS_CLEARANCE = 0.25
 POST_TOP_Z = 1.90  # posts extend roughly from the ground to this height
 APPROACH_DIST = 0.4  # offset of the approach waypoint in front of a gate
 EXIT_DIST = 0.4  # offset of the exit waypoint behind a gate
 PATH_SAMPLE_STEP = 0.1  # densification step for the polyline (m)
 RELAX_ITERS = 20  # avoidance / smoothing passes
-SMOOTH_W_SELF = 0.8  # smoothing weights — higher self => weaker smoothing
-SMOOTH_W_NEIGHBOR = 0.0
-SMOOTH_W_REF = 0.7  # attraction weight to the previous path to enforce consistency
-TARGET_SPEED = 0.8 # m/s, used to time-parameterize the path
+SMOOTH_W_SELF = 0.99  # smoothing weights — higher self => weaker smoothing
+SMOOTH_W_NEIGHBOR = 0.
+SMOOTH_W_REF = 0.2  # attraction weight to the previous path to enforce consistency
+TARGET_SPEED = 0.5 # m/s, used to time-parameterize the path
 GATE_REPLAN_DIST = 0.7  # replan when first entering this radius around each gate (m)
-GATE2_APPROACH_SPEED = 0.4  # reduced speed through gate 2 (tight gap)
+GATE2_APPROACH_SPEED = 0.5  # reduced speed through gate 2 (tight gap)
 GATE2_SLOW_RADIUS = 0.8  # m from gate 2 centre over which the slowdown applies
 LOG_DIR = Path(os.environ.get("LSY_PATH_LOG_DIR", "/tmp/lsy_drone_paths"))
 
@@ -166,7 +166,7 @@ class AdaptiveController(Controller):
             if i == 0:
                 app_d = min(0.2, max(0, d * 0.5))
             elif i == 1:
-                app_d = min(2.0, max(0.5, d * 0.5))
+                app_d = min(2.0, max(1.0, d * 0.5))
             elif i == 2:
                 app_d = min(0.5, max(0, d * 0.5))
             elif i == 3:
@@ -174,14 +174,22 @@ class AdaptiveController(Controller):
             else:
                 app_d = 0.4
 
-            wps.append(g - axis * app_d)
-            wps.append(g.copy())
+            # Skip approach / center waypoints that lie behind the current point along
+            # the gate's forward axis — otherwise the polyline (and resulting spline)
+            # loops backward inside the gate when seeded from a commanded state that
+            # has already advanced past them.
+            s_cur = float(np.dot(cur_pt - g, axis))
+            FWD_EPS = 0.05
+            if s_cur < -app_d - FWD_EPS:
+                wps.append(g - axis * app_d)
+            if s_cur < -FWD_EPS:
+                wps.append(g.copy())
             if i == 0:
-                wps.append(g + axis * 0.5)
+                wps.append(g + axis * 1.0)
             elif i == 1:
                 wps.append(g + axis * 0.6)
             elif i == 2:
-                wps.append(g + axis * 0.15)
+                wps.append(g + axis * 0.1)
                 wps.append(g - axis * 0.4)
 
             elif i == 3:
